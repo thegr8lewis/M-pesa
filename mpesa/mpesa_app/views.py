@@ -6,7 +6,8 @@ from django.http import JsonResponse, HttpResponseBadRequest
 from .models import Transaction
 from .forms import PaymentForm
 from dotenv import load_dotenv
-import traceback  
+import traceback 
+from django.db import IntegrityError, transaction 
 
 # Load environment variables
 load_dotenv()
@@ -20,6 +21,7 @@ CALLBACK_URL = os.getenv("CALLBACK_URL")
 MPESA_BASE_URL = os.getenv("MPESA_BASE_URL")
 
 
+
 @csrf_exempt
 def payment_api(request):
     if request.method == "POST":
@@ -28,62 +30,53 @@ def payment_api(request):
             phone = format_phone_number(data["phone_number"])
             amount = data["amount"]
             
-            # Validate amount
-            try:
-                amount_float = float(amount)
-                if amount_float < 1:  # Minimum 1 KES
+            # First initiate STK push with Safaricom
+            stk_response = initiate_stk_push(phone, amount)
+            
+            if stk_response.get("ResponseCode") == "0":
+                # Create transaction record in atomic transaction
+                try:
+                    with transaction.atomic():
+                        trans = Transaction.objects.create(
+                            amount=amount,
+                            checkout_id=stk_response["CheckoutRequestID"],
+                            phone_number=phone,
+                            status="PENDING"
+                        )
+                        
                     return JsonResponse({
-                        "status": "error",
-                        "message": "Amount must be at least 1 KES"
-                    }, status=400)
-            except ValueError:
-                return JsonResponse({
-                    "status": "error",
-                    "message": "Invalid amount format"
-                }, status=400)
-            
-            response = initiate_stk_push(phone, amount)
-            
-            if response.get("ResponseCode") == "0":
-                # Save transaction to database
-                Transaction.objects.create(
-                    phone_number=phone,
-                    amount=amount,
-                    checkout_id=response["CheckoutRequestID"],
-                    status="Pending"
-                )
-                
-                return JsonResponse({
-                    "status": "pending",
-                    "checkout_request_id": response["CheckoutRequestID"],
-                    "merchant_request_id": response["MerchantRequestID"],
-                    "message": "STK push initiated successfully"
-                })
+                        "status": "pending",
+                        "checkout_request_id": trans.checkout_id,
+                        "message": "STK push initiated successfully"
+                    })
+                    
+                except IntegrityError as e:
+                    if "checkout_id" in str(e):
+                        # Handle case where checkout_id already exists
+                        existing = Transaction.objects.get(
+                            checkout_id=stk_response["CheckoutRequestID"]
+                        )
+                        return JsonResponse({
+                            "status": existing.status.lower(),
+                            "checkout_request_id": existing.checkout_id,
+                            "message": f"Payment already {existing.status.lower()}"
+                        })
+                    raise
+                    
             else:
-                error_msg = response.get("errorMessage") or response.get("ResponseDescription") or "Failed to send STK push"
+                error_msg = stk_response.get("errorMessage") or "Failed to initiate payment"
                 return JsonResponse({
                     "status": "error",
-                    "message": error_msg,
-                    "raw_response": response
+                    "message": error_msg
                 }, status=400)
                 
-        except json.JSONDecodeError:
-            return JsonResponse({
-                "status": "error",
-                "message": "Invalid JSON data"
-            }, status=400)
-        except ValueError as e:
-            return JsonResponse({
-                "status": "error",
-                "message": str(e)
-            }, status=400)
         except Exception as e:
             return JsonResponse({
                 "status": "error",
                 "message": str(e),
                 "trace": traceback.format_exc()
             }, status=500)
-
+    
     return JsonResponse({
         "error": "Invalid request method"
     }, status=405)
@@ -246,32 +239,54 @@ def payment_callback(request):
 
     try:
         callback_data = json.loads(request.body)
-        result_code = callback_data["Body"]["stkCallback"]["ResultCode"]
-
+        callback = callback_data["Body"]["stkCallback"]
+        result_code = callback["ResultCode"]
+        checkout_id = callback["CheckoutRequestID"]
+        
+        # Try to get existing transaction
+        try:
+            trans = Transaction.objects.get(checkout_id=checkout_id)
+        except Transaction.DoesNotExist:
+            return JsonResponse({
+                "ResultCode": 1,
+                "ResultDesc": "Transaction not found"
+            })
+        
         if result_code == 0:
-            checkout_id = callback_data["Body"]["stkCallback"]["CheckoutRequestID"]
-            metadata = callback_data["Body"]["stkCallback"]["CallbackMetadata"]["Item"]
-
-            amount = next(item["Value"] for item in metadata if item["Name"] == "Amount")
-            mpesa_code = next(item["Value"] for item in metadata if item["Name"] == "MpesaReceiptNumber")
-            phone = next(item["Value"] for item in metadata if item["Name"] == "PhoneNumber")
-
-            Transaction.objects.create(
-                amount=amount, 
-                checkout_id=checkout_id, 
-                mpesa_code=mpesa_code, 
-                phone_number=phone, 
-                status="Success"
+            # Successful payment
+            metadata = callback["CallbackMetadata"]["Item"]
+            
+            trans.mpesa_code = next(
+                item["Value"] for item in metadata 
+                if item["Name"] == "MpesaReceiptNumber"
             )
+            trans.amount = next(
+                item["Value"] for item in metadata 
+                if item["Name"] == "Amount"
+            )
+            trans.phone_number = next(
+                item["Value"] for item in metadata 
+                if item["Name"] == "PhoneNumber"
+            )
+            trans.status = "SUCCESS"
+            trans.save()
+            
             return JsonResponse({
                 "ResultCode": 0,
                 "ResultDesc": "Payment successful"
             })
-
+        else:
+            # Failed payment
+            trans.status = "FAILED"
+            trans.save()
+            
+            return JsonResponse({
+                "ResultCode": result_code,
+                "ResultDesc": callback.get("ResultDesc", "Payment failed")
+            })
+            
+    except Exception as e:
         return JsonResponse({
-            "ResultCode": result_code,
-            "ResultDesc": "Payment failed"
+            "ResultCode": 1,
+            "ResultDesc": f"Error processing callback: {str(e)}"
         })
-
-    except (json.JSONDecodeError, KeyError) as e:
-        return HttpResponseBadRequest(f"Invalid request data: {str(e)}")

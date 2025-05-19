@@ -48,7 +48,7 @@ const CheckoutPage = () => {
     setFormData(prev => ({ ...prev, [name]: value }));
   };
 
-    const handleSubmit = async (e) => {
+  const handleSubmit = async (e) => {
   e.preventDefault();
   setIsLoading(true);
   setErrorMessage('');
@@ -59,7 +59,6 @@ const CheckoutPage = () => {
       throw new Error('Please enter a valid Kenyan phone number (e.g., 07... or 254...)');
     }
 
-    // FIXED: Remove duplicate http://
     const response = await fetch('http://localhost:8000/api/payment/', {
       method: 'POST',
       headers: {
@@ -72,23 +71,28 @@ const CheckoutPage = () => {
       }),
     });
 
-    // Add network error handling
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      throw new Error(errorData.message || `HTTP error! status: ${response.status}`);
-    }
-
     const data = await response.json();
 
-    if (data.status !== 'pending') {
-      throw new Error(data.message || 'Unexpected response from server');
+    // Handle case where payment was already initiated
+    if (data.status === 'pending' || data.status === 'success') {
+      setCheckoutRequestId(data.checkout_request_id);
+      setStep('pending');
+      if (data.status === 'success') {
+        setStatusMessage('Payment already completed!');
+        setStep('success');
+        localStorage.removeItem('cart');
+      }
+      return;
+    }
+
+    if (!response.ok) {
+      throw new Error(data.message || 'Failed to initiate payment');
     }
 
     setCheckoutRequestId(data.checkout_request_id);
     setStep('pending');
   } catch (err) {
-    console.error('Payment initiation error:', err);
-    setErrorMessage(err.message || 'Failed to initiate payment');
+    setErrorMessage(err.message);
     setStep('error');
   } finally {
     setIsLoading(false);
